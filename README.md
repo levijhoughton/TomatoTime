@@ -22,11 +22,19 @@ check the chime and music pausing.
 | Sprint | 15 / 3 min | 4 | 10 min |
 | Deep work | 50 / 10 min | 2 | 25 min |
 | Flow | 90 / 20 min | 2 | 30 min |
+| Custom | your own | your own | your own |
 | Try it | 10 / 5 sec | 2 | 8 sec |
+
+Pick **Custom** in the menu to set the focus, short break and long break lengths (in minutes) and the number of rounds.
+
+## Control it from elsewhere
+
+- **Global hotkey:** `⌃⌥T` starts and pauses the timer from any app. Turn it off in the menu if it clashes with something.
+- **URL scheme:** `open tomatotime://startStop` (also `start`, `pause`, `skip`, `reset`), handy for Shortcuts, Raycast or a script.
+- **Event log:** every start, pause, skip, reset and finished round is appended as one JSON line to `~/Library/Logs/TomatoTime/events.log`.
 
 ## Notes
 
 - macOS asks once for permission to control Music and Spotify, and once for notifications.
 - "Pause browsers and other apps too" (on by default) sends the Play/Pause media key, but only if the Mac is still producing sound after Music/Spotify were paused. Needs Accessibility permission. Resumes with the same key when the next focus round starts.
 - Ad-hoc signed only: fine on your own Mac, not distributable.
-- Written without access to a Mac or Swift toolchain, so it had not been compiled when first committed.

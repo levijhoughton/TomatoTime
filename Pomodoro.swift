@@ -2,6 +2,7 @@ import SwiftUI
 import AppKit
 import UserNotifications
 import CoreAudio
+import Carbon.HIToolbox
 
 // MARK: - Varieties and break ideas
 
@@ -13,6 +14,25 @@ struct Variety: Identifiable, Hashable {
     let short: TimeInterval
     let long: TimeInterval
     let rounds: Int
+
+    // Identity is the id alone, so the Custom entry stays selected while its numbers change.
+    static func == (a: Variety, b: Variety) -> Bool { a.id == b.id }
+    func hash(into hasher: inout Hasher) { hasher.combine(id) }
+}
+
+/// The user's own durations, in minutes.
+struct CustomSpec: Codable, Equatable {
+    var focus = 25
+    var short = 5
+    var long = 15
+    var rounds = 4
+
+    var variety: Variety {
+        Variety(id: "custom", name: "Custom",
+                blurb: "\(focus) on, \(short) off. A \(long) minute break after \(rounds) rounds.",
+                focus: TimeInterval(focus * 60), short: TimeInterval(short * 60),
+                long: TimeInterval(long * 60), rounds: rounds)
+    }
 }
 
 let varieties: [Variety] = [
@@ -59,16 +79,83 @@ final class NotifyDelegate: NSObject, UNUserNotificationCenterDelegate {
     }
 }
 
+// MARK: - Global hotkey
+
+/// Control-Option-T, registered through Carbon so it works without Accessibility permission.
+final class HotKey {
+    var onPress: () -> Void = {}
+    private var ref: EventHotKeyRef?
+    private var handler: EventHandlerRef?
+
+    init() {
+        var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+        InstallEventHandler(GetApplicationEventTarget(), { _, _, userData in
+            guard let userData else { return noErr }
+            Unmanaged<HotKey>.fromOpaque(userData).takeUnretainedValue().onPress()
+            return noErr
+        }, 1, &spec, Unmanaged.passUnretained(self).toOpaque(), &handler)
+    }
+
+    func setEnabled(_ on: Bool) {
+        if on && ref == nil {
+            RegisterEventHotKey(UInt32(kVK_ANSI_T), UInt32(controlKey | optionKey),
+                                EventHotKeyID(signature: OSType(0x544D5452), id: 1),
+                                GetApplicationEventTarget(), 0, &ref)
+        } else if !on, let r = ref {
+            UnregisterEventHotKey(r)
+            ref = nil
+        }
+    }
+}
+
+// MARK: - Event log
+
+/// One JSON object per line, for analysing your own focus time.
+enum EventLog {
+    static let url = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Logs/TomatoTime/events.log")
+
+    static func write(_ fields: [String: Any]) {
+        var entry = fields
+        entry["time"] = ISO8601DateFormatter().string(from: Date())
+        guard var line = try? JSONSerialization.data(withJSONObject: entry, options: [.sortedKeys]) else { return }
+        line.append(0x0A)
+        let fm = FileManager.default
+        try? fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if !fm.fileExists(atPath: url.path) { fm.createFile(atPath: url.path, contents: nil) }
+        guard let handle = try? FileHandle(forWritingTo: url) else { return }
+        defer { try? handle.close() }
+        _ = try? handle.seekToEnd()
+        try? handle.write(contentsOf: line)
+    }
+}
+
 // MARK: - Model
 
 @MainActor
 final class PomodoroModel: ObservableObject {
-    enum Phase { case focus, shortBreak, longBreak }
+    static let shared = PomodoroModel()
+
+    enum Phase: String { case focus, shortBreak, longBreak }
 
     @Published var variety: Variety {
         didSet {
             UserDefaults.standard.set(variety.id, forKey: "variety")
             reset()
+        }
+    }
+    @Published var customSpec: CustomSpec {
+        didSet {
+            if let data = try? JSONEncoder().encode(customSpec) {
+                UserDefaults.standard.set(data, forKey: "customSpec")
+            }
+            if variety.id == "custom" { variety = customSpec.variety }
+        }
+    }
+    @Published var hotKeyEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(hotKeyEnabled, forKey: "hotKeyEnabled")
+            hotKey.setEnabled(hotKeyEnabled)
         }
     }
     @Published var autoContinue: Bool {
@@ -91,16 +178,25 @@ final class PomodoroModel: ObservableObject {
     private var pausedPlayers: [String] = []
     private var sentMediaKey = false
     private let notifyDelegate = NotifyDelegate()
+    private let hotKey = HotKey()
+
+    var allVarieties: [Variety] { varieties + [customSpec.variety] }
 
     init() {
         let d = UserDefaults.standard
+        let spec = d.data(forKey: "customSpec").flatMap { try? JSONDecoder().decode(CustomSpec.self, from: $0) } ?? CustomSpec()
+        customSpec = spec
         let saved = d.string(forKey: "variety")
-        let v = varieties.first { $0.id == saved } ?? varieties[0]
+        let v = saved == "custom" ? spec.variety : (varieties.first { $0.id == saved } ?? varieties[0])
         variety = v
         remaining = v.focus
         autoContinue = d.object(forKey: "autoContinue") as? Bool ?? true
         pauseOthers = d.object(forKey: "pauseOthers") as? Bool ?? true
+        hotKeyEnabled = d.object(forKey: "hotKeyEnabled") as? Bool ?? true
         if pauseOthers && !CGPreflightPostEventAccess() { _ = CGRequestPostEventAccess() }
+
+        hotKey.onPress = { [weak self] in Task { @MainActor in self?.toggle() } }
+        hotKey.setEnabled(hotKeyEnabled)
 
         if Bundle.main.bundleIdentifier != nil {
             let center = UNUserNotificationCenter.current()
@@ -145,8 +241,27 @@ final class PomodoroModel: ObservableObject {
 
     func toggle() { running ? pause() : start() }
 
+    /// Handles tomatotime://startStop, start, pause, skip and reset.
+    func handle(url: URL) {
+        guard url.scheme == "tomatotime" else { return }
+        switch url.host?.lowercased() {
+        case "startstop": toggle()
+        case "start": start()
+        case "pause": pause()
+        case "skip": skip()
+        case "reset": reset()
+        default: break
+        }
+    }
+
+    private func log(_ event: String) {
+        EventLog.write(["event": event, "phase": phase.rawValue, "round": round,
+                        "style": variety.id, "remaining": Int(max(0, remaining))])
+    }
+
     func start() {
         guard !running else { return }
+        log("start")
         endDate = Date().addingTimeInterval(remaining)
         running = true
         // .common so it keeps ticking while the popover is open.
@@ -162,9 +277,11 @@ final class PomodoroModel: ObservableObject {
         guard running else { return }
         remaining = max(0, endDate?.timeIntervalSinceNow ?? remaining)
         stopTimer()
+        log("pause")
     }
 
     func reset() {
+        log("reset")
         stopTimer()
         phase = .focus
         round = 1
@@ -173,6 +290,7 @@ final class PomodoroModel: ObservableObject {
     }
 
     func skip() {
+        log("skip")
         let wasRunning = running
         stopTimer()
         let cycleDone = advance()
@@ -194,6 +312,7 @@ final class PomodoroModel: ObservableObject {
 
     private func finishPhase() {
         let ended = phase
+        log("phase_end")
         stopTimer()
         let cycleDone = advance()
         alert(after: ended)
@@ -361,10 +480,17 @@ struct PopoverView: View {
 
             VStack(alignment: .leading, spacing: 6) {
                 Picker("Style", selection: $m.variety) {
-                    ForEach(varieties) { Text($0.name).tag($0) }
+                    ForEach(m.allVarieties) { Text($0.name).tag($0) }
                 }
                 Text(m.variety.blurb).font(.caption).foregroundStyle(.secondary)
+                if m.variety.id == "custom" {
+                    Stepper("Focus: \(m.customSpec.focus) min", value: $m.customSpec.focus, in: 1...180)
+                    Stepper("Short break: \(m.customSpec.short) min", value: $m.customSpec.short, in: 1...60)
+                    Stepper("Long break: \(m.customSpec.long) min", value: $m.customSpec.long, in: 1...120)
+                    Stepper("Rounds: \(m.customSpec.rounds)", value: $m.customSpec.rounds, in: 1...12)
+                }
                 Toggle("Keep going automatically", isOn: $m.autoContinue)
+                Toggle("Global hotkey ⌃⌥T starts and pauses", isOn: $m.hotKeyEnabled)
                 Toggle("Pause browsers and other apps too", isOn: $m.pauseOthers)
                 if m.pauseOthers {
                     Text("Uses the Play/Pause key when sound is still playing. Needs Accessibility permission.")
@@ -427,9 +553,16 @@ struct PopoverView: View {
     }
 }
 
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func application(_ application: NSApplication, open urls: [URL]) {
+        Task { @MainActor in urls.forEach { PomodoroModel.shared.handle(url: $0) } }
+    }
+}
+
 @main
 struct PomodoroApp: App {
-    @StateObject private var model = PomodoroModel()
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+    @StateObject private var model = PomodoroModel.shared
 
     var body: some Scene {
         MenuBarExtra {

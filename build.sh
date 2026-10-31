@@ -24,6 +24,13 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
   <key>CFBundleShortVersionString</key><string>1.0</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>LSUIElement</key><true/>
+  <key>CFBundleURLTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleURLName</key><string>local.pomodoro.menubar</string>
+      <key>CFBundleURLSchemes</key><array><string>tomatotime</string></array>
+    </dict>
+  </array>
   <key>NSAppleEventsUsageDescription</key>
   <string>Pomodoro pauses Music and Spotify when a timer goes off.</string>
 </dict>
