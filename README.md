@@ -29,7 +29,7 @@ Pick **Custom** in the menu to set the focus, short break and long break lengths
 
 ## Control it from elsewhere
 
-- **Global hotkey:** `⌃⌥T` starts and pauses the timer from any app. Turn it off in the menu if it clashes with something.
+- **Global hotkey:** `⌃⌥T` starts and pauses the timer from any app. In the menu, click the shortcut to record a different one (it needs at least one of ⌃ ⌥ ⌘; Esc cancels), use Reset to go back to `⌃⌥T`, or switch the hotkey off.
 - **URL scheme:** `open tomatotime://startStop` (also `start`, `pause`, `skip`, `reset`), handy for Shortcuts, Raycast or a script.
 - **Event log:** every start, pause, skip, reset and finished round is appended as one JSON line to `~/Library/Logs/TomatoTime/events.log`.
 

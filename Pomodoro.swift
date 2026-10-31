@@ -81,11 +81,22 @@ final class NotifyDelegate: NSObject, UNUserNotificationCenterDelegate {
 
 // MARK: - Global hotkey
 
-/// Control-Option-T, registered through Carbon so it works without Accessibility permission.
+/// A global shortcut: a key plus Carbon modifier flags, and how to show it.
+struct Shortcut: Codable, Equatable {
+    var keyCode: UInt32
+    var modifiers: UInt32
+    var label: String
+
+    static let standard = Shortcut(keyCode: UInt32(kVK_ANSI_T),
+                                   modifiers: UInt32(controlKey | optionKey), label: "⌃⌥T")
+}
+
+/// Registered through Carbon so it works without Accessibility permission.
 final class HotKey {
     var onPress: () -> Void = {}
     private var ref: EventHotKeyRef?
     private var handler: EventHandlerRef?
+    private var current: Shortcut?
 
     init() {
         var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
@@ -96,15 +107,32 @@ final class HotKey {
         }, 1, &spec, Unmanaged.passUnretained(self).toOpaque(), &handler)
     }
 
-    func setEnabled(_ on: Bool) {
-        if on && ref == nil {
-            RegisterEventHotKey(UInt32(kVK_ANSI_T), UInt32(controlKey | optionKey),
-                                EventHotKeyID(signature: OSType(0x544D5452), id: 1),
-                                GetApplicationEventTarget(), 0, &ref)
-        } else if !on, let r = ref {
-            UnregisterEventHotKey(r)
-            ref = nil
-        }
+    /// Registers `shortcut`, or nothing when nil. If the new one is refused, the previous one stays active.
+    @discardableResult
+    func set(_ shortcut: Shortcut?) -> Bool {
+        let previous = current
+        unregister()
+        guard let shortcut else { return true }
+        if register(shortcut) { return true }
+        if let previous { _ = register(previous) }
+        return false
+    }
+
+    private func register(_ s: Shortcut) -> Bool {
+        var newRef: EventHotKeyRef?
+        let status = RegisterEventHotKey(s.keyCode, s.modifiers,
+                                         EventHotKeyID(signature: OSType(0x544D5452), id: 1),
+                                         GetApplicationEventTarget(), 0, &newRef)
+        guard status == noErr else { return false }
+        ref = newRef
+        current = s
+        return true
+    }
+
+    private func unregister() {
+        if let r = ref { UnregisterEventHotKey(r) }
+        ref = nil
+        current = nil
     }
 }
 
@@ -155,9 +183,12 @@ final class PomodoroModel: ObservableObject {
     @Published var hotKeyEnabled: Bool {
         didSet {
             UserDefaults.standard.set(hotKeyEnabled, forKey: "hotKeyEnabled")
-            hotKey.setEnabled(hotKeyEnabled)
+            hotKey.set(hotKeyEnabled ? shortcut : nil)
         }
     }
+    @Published private(set) var shortcut: Shortcut
+    @Published private(set) var recording = false
+    @Published private(set) var shortcutError: String?
     @Published var autoContinue: Bool {
         didSet { UserDefaults.standard.set(autoContinue, forKey: "autoContinue") }
     }
@@ -179,6 +210,7 @@ final class PomodoroModel: ObservableObject {
     private var sentMediaKey = false
     private let notifyDelegate = NotifyDelegate()
     private let hotKey = HotKey()
+    private var recordMonitor: Any?
 
     var allVarieties: [Variety] { varieties + [customSpec.variety] }
 
@@ -193,10 +225,11 @@ final class PomodoroModel: ObservableObject {
         autoContinue = d.object(forKey: "autoContinue") as? Bool ?? true
         pauseOthers = d.object(forKey: "pauseOthers") as? Bool ?? true
         hotKeyEnabled = d.object(forKey: "hotKeyEnabled") as? Bool ?? true
+        shortcut = d.data(forKey: "shortcut").flatMap { try? JSONDecoder().decode(Shortcut.self, from: $0) } ?? .standard
         if pauseOthers && !CGPreflightPostEventAccess() { _ = CGRequestPostEventAccess() }
 
         hotKey.onPress = { [weak self] in Task { @MainActor in self?.toggle() } }
-        hotKey.setEnabled(hotKeyEnabled)
+        hotKey.set(hotKeyEnabled ? shortcut : nil)
 
         if Bundle.main.bundleIdentifier != nil {
             let center = UNUserNotificationCenter.current()
@@ -252,6 +285,65 @@ final class PomodoroModel: ObservableObject {
         case "reset": reset()
         default: break
         }
+    }
+
+    // MARK: Shortcut recording
+
+    /// Listens for the next key combination. Esc cancels; at least one of ⌃ ⌥ ⌘ is required.
+    func beginRecording() {
+        guard recordMonitor == nil else { return }
+        recording = true
+        shortcutError = nil
+        hotKey.set(nil)  // so pressing the current combo doesn't toggle the timer
+        recordMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            MainActor.assumeIsolated { self?.capture(event) }
+            return nil
+        }
+    }
+
+    func endRecording() {
+        guard recordMonitor != nil else { return }
+        if let m = recordMonitor { NSEvent.removeMonitor(m) }
+        recordMonitor = nil
+        recording = false
+        hotKey.set(hotKeyEnabled ? shortcut : nil)
+    }
+
+    func resetShortcut() {
+        endRecording()
+        apply(.standard)
+    }
+
+    private func capture(_ event: NSEvent) {
+        if event.keyCode == UInt16(kVK_Escape) { endRecording(); return }
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        guard flags.contains(.control) || flags.contains(.option) || flags.contains(.command) else {
+            shortcutError = "Include ⌃, ⌥ or ⌘ in the shortcut."
+            return
+        }
+        var mods: UInt32 = 0
+        var label = ""
+        if flags.contains(.control) { mods |= UInt32(controlKey); label += "⌃" }
+        if flags.contains(.option) { mods |= UInt32(optionKey); label += "⌥" }
+        if flags.contains(.shift) { mods |= UInt32(shiftKey); label += "⇧" }
+        if flags.contains(.command) { mods |= UInt32(cmdKey); label += "⌘" }
+        let key = event.keyCode == UInt16(kVK_Space) ? "Space" : (event.charactersIgnoringModifiers ?? "?").uppercased()
+        let new = Shortcut(keyCode: UInt32(event.keyCode), modifiers: mods, label: label + key)
+
+        endRecording()
+        apply(new)
+    }
+
+    private func apply(_ new: Shortcut) {
+        let old = shortcut
+        if hotKeyEnabled && !hotKey.set(new) {
+            hotKey.set(old)
+            shortcutError = "\(new.label) is already taken. Kept \(old.label)."
+            return
+        }
+        shortcut = new
+        shortcutError = nil
+        if let data = try? JSONEncoder().encode(new) { UserDefaults.standard.set(data, forKey: "shortcut") }
     }
 
     private func log(_ event: String) {
@@ -490,7 +582,22 @@ struct PopoverView: View {
                     Stepper("Rounds: \(m.customSpec.rounds)", value: $m.customSpec.rounds, in: 1...12)
                 }
                 Toggle("Keep going automatically", isOn: $m.autoContinue)
-                Toggle("Global hotkey ⌃⌥T starts and pauses", isOn: $m.hotKeyEnabled)
+                HStack {
+                    Toggle("Global hotkey", isOn: $m.hotKeyEnabled)
+                    Spacer()
+                    Button(m.recording ? "Press keys…" : m.shortcut.label) {
+                        m.recording ? m.endRecording() : m.beginRecording()
+                    }
+                    .disabled(!m.hotKeyEnabled)
+                    if m.shortcut != .standard && !m.recording {
+                        Button("Reset") { m.resetShortcut() }
+                    }
+                }
+                if let error = m.shortcutError {
+                    Text(error).font(.caption).foregroundStyle(.red)
+                } else if m.recording {
+                    Text("Press the new shortcut, or Esc to cancel.").font(.caption).foregroundStyle(.secondary)
+                }
                 Toggle("Pause browsers and other apps too", isOn: $m.pauseOthers)
                 if m.pauseOthers {
                     Text("Uses the Play/Pause key when sound is still playing. Needs Accessibility permission.")
@@ -506,6 +613,7 @@ struct PopoverView: View {
         }
         .padding(16)
         .frame(width: 300)
+        .onDisappear { m.endRecording() }
     }
 
     private var ring: some View {
