@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import UserNotifications
+import CoreAudio
 
 // MARK: - Varieties and break ideas
 
@@ -74,7 +75,10 @@ final class PomodoroModel: ObservableObject {
         didSet { UserDefaults.standard.set(autoContinue, forKey: "autoContinue") }
     }
     @Published var pauseOthers: Bool {
-        didSet { UserDefaults.standard.set(pauseOthers, forKey: "pauseOthers") }
+        didSet {
+            UserDefaults.standard.set(pauseOthers, forKey: "pauseOthers")
+            if pauseOthers { _ = CGRequestPostEventAccess() }
+        }
     }
     @Published private(set) var phase: Phase = .focus
     @Published private(set) var round = 1
@@ -95,7 +99,8 @@ final class PomodoroModel: ObservableObject {
         variety = v
         remaining = v.focus
         autoContinue = d.object(forKey: "autoContinue") as? Bool ?? true
-        pauseOthers = d.bool(forKey: "pauseOthers")
+        pauseOthers = d.object(forKey: "pauseOthers") as? Bool ?? true
+        if pauseOthers && !CGPreflightPostEventAccess() { _ = CGRequestPostEventAccess() }
 
         if Bundle.main.bundleIdentifier != nil {
             let center = UNUserNotificationCenter.current()
@@ -191,7 +196,7 @@ final class PomodoroModel: ObservableObject {
         let ended = phase
         stopTimer()
         let cycleDone = advance()
-        alert(after: ended, cycleDone: cycleDone)
+        alert(after: ended)
         if autoContinue && !cycleDone { start() }
     }
 
@@ -221,9 +226,7 @@ final class PomodoroModel: ObservableObject {
 
     // MARK: Alert
 
-    private func alert(after ended: Phase, cycleDone: Bool) {
-        pauseMedia()
-
+    private func alert(after ended: Phase) {
         let title: String
         let body: String
         switch ended {
@@ -237,8 +240,12 @@ final class PomodoroModel: ObservableObject {
             title = "Cycle complete 🎉"
             body = "Start another whenever you like."
         }
-        NSSound(named: ended == .focus ? "Glass" : "Hero")?.play()
-        notify(title: title, body: body)
+        Task { @MainActor in
+            // Only when focus ends: a break ending shouldn't silence music you chose to play.
+            if ended == .focus { await pauseMedia() }
+            NSSound(named: ended == .focus ? "Glass" : "Hero")?.play()
+            notify(title: title, body: body)
+        }
     }
 
     private func notify(title: String, body: String) {
@@ -254,9 +261,10 @@ final class PomodoroModel: ObservableObject {
 
     private let players = [("Music", "com.apple.Music"), ("Spotify", "com.spotify.client")]
 
-    private func pauseMedia() {
+    private func pauseMedia() async {
         pausedPlayers = []
         sentMediaKey = false
+        // 1. Music and Spotify: asked directly, and only paused if they are playing.
         let running = NSWorkspace.shared.runningApplications.compactMap(\.bundleIdentifier)
         for (name, bundle) in players where running.contains(bundle) {
             let source = """
@@ -270,12 +278,32 @@ final class PomodoroModel: ObservableObject {
             """
             if runScript(source) == "paused" { pausedPlayers.append(name) }
         }
-        // The media key is a toggle with no way to ask "is anything playing?",
-        // so only use it when the apps we can query had nothing to pause.
-        if pauseOthers && pausedPlayers.isEmpty {
+        guard pauseOthers else { return }
+        // 2. Anything else (browsers, video players, podcasts): if the Mac is still
+        // producing sound once the apps above have stopped, send the Play/Pause key.
+        // The key is a toggle, so it is only sent when sound is actually playing.
+        try? await Task.sleep(nanoseconds: 600_000_000)
+        if isAudioPlaying() {
             sendPlayPauseKey()
             sentMediaKey = true
         }
+    }
+
+    /// True if any app is currently sending sound to the default output device.
+    private func isAudioPlaying() -> Bool {
+        var deviceID = AudioObjectID(0)
+        var size = UInt32(MemoryLayout<AudioObjectID>.size)
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject),
+                                         &address, 0, nil, &size, &deviceID) == noErr else { return false }
+        var active: UInt32 = 0
+        size = UInt32(MemoryLayout<UInt32>.size)
+        address.mSelector = kAudioDevicePropertyDeviceIsRunningSomewhere
+        guard AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &active) == noErr else { return false }
+        return active != 0
     }
 
     private func resumeMedia() {
@@ -337,15 +365,15 @@ struct PopoverView: View {
                 }
                 Text(m.variety.blurb).font(.caption).foregroundStyle(.secondary)
                 Toggle("Keep going automatically", isOn: $m.autoContinue)
-                Toggle("Also pause browsers and other apps", isOn: $m.pauseOthers)
+                Toggle("Pause browsers and other apps too", isOn: $m.pauseOthers)
                 if m.pauseOthers {
-                    Text("Sends the Play/Pause key, which toggles. Could start something if nothing was playing.")
+                    Text("Uses the Play/Pause key when sound is still playing. Needs Accessibility permission.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
             }
 
             HStack {
-                Text("Pauses Music and Spotify when the bell rings").font(.caption).foregroundStyle(.secondary)
+                Text("Pauses music and videos when the bell rings").font(.caption).foregroundStyle(.secondary)
                 Spacer()
                 Button("Quit") { NSApplication.shared.terminate(nil) }
             }

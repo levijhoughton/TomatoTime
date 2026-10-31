@@ -1,7 +1,7 @@
 # TomatoTime
 
 A small macOS menu bar pomodoro timer. Shows the countdown in the menu bar, pauses
-Music and Spotify when a timer goes off, and suggests a break activity.
+music and videos (Music, Spotify, browsers and more) when a timer goes off, and suggests a break activity.
 
 ## Build
 
@@ -27,7 +27,6 @@ check the chime and music pausing.
 ## Notes
 
 - macOS asks once for permission to control Music and Spotify, and once for notifications.
-- "Also pause browsers and other apps" sends the Play/Pause media key. It is a toggle, so it
-  can start playback if nothing was playing. Off by default.
+- "Pause browsers and other apps too" (on by default) sends the Play/Pause media key, but only if the Mac is still producing sound after Music/Spotify were paused. Needs Accessibility permission. Resumes with the same key when the next focus round starts.
 - Ad-hoc signed only: fine on your own Mac, not distributable.
 - Written without access to a Mac or Swift toolchain, so it had not been compiled when first committed.
